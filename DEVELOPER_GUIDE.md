@@ -2,7 +2,7 @@
 
 本文面向需要阅读、调试、扩展和维护 `agents-hive` 的开发者。内容以当前源码为准，重点解释项目结构、启动链路、核心模块、前后端通信、配置来源、数据库迁移、测试命令和常见排障路径。
 
-> 校验日期：2026-05-16  
+> 校验日期：2026-05-19  
 > 主要依据：`README.md`、`DESIGN.md`、`cmd/*`、`internal/bootstrap`、`internal/api`、`internal/master`、`internal/tools`、`internal/store`、`frontend/src`、`Dockerfile`、`docker-compose.yml`、`config.example.json`。
 
 ## 1. 项目定位
@@ -225,7 +225,7 @@ Go 入口：
 | `internal/llm` | LLM client、provider、Responses/Chat 转换、token 计数 |
 | `internal/airouter` | 按任务类型路由 LLM、图片、视频、TTS、STT、Embedding 适配 |
 | `internal/store` | PostgreSQL store、迁移、会话/配置/Prompt/Skill 等存储 |
-| `internal/auth` | OAuth/LDAP/JWT/user/quota 认证授权 |
+| `internal/auth` | OAuth/LDAP/本地登录、JWT、注册/邀请码、用户/配额 |
 | `internal/channel` | IM 抽象路由、去重、重试、renderer、push |
 | `internal/channel/feishu` | 飞书插件、长连接、webhook、renderer、重试、chat state |
 | `internal/channel/dingtalk` | 钉钉插件 |
@@ -598,6 +598,10 @@ IM API：
 - 修正部分非法负值。
 - 规范化 Asset 和 ToolRecall 配置。
 
+### 8.5 认证相关配置
+
+启动期见 `config.json` 的 `auth` 段（`allow_public_registration`、`jwt_ttl`、`seed_default_admin` 等）。飞书/钉钉/LDAP 的配置与使用见 **§12.2.1**；JSON 字段示例见 **§12.3.1**；注册/邀请码见 **§12.4**。
+
 ## 9. HTTP API、WebSocket 与前端静态资源
 
 ### 9.1 API Server
@@ -717,15 +721,19 @@ Wechatbot：
 - `GET /api/v1/wechat/events`
 - `GET /api/v1/wechat/conversations`
 
-Auth 启用后才注册：
+认证相关（`authEngine != nil` 时；公开端点见 §12.4）：
 
+- `GET /api/v1/auth/status` — 是否就绪、`allow_public_registration` 等（前端 `AuthGuard`）
 - `GET /api/v1/auth/providers`
-- `GET /api/v1/auth/login`
-- `GET /api/v1/auth/callback`
-- `POST /api/v1/auth/login`
-- `GET /api/v1/auth/me`
-- `POST /api/v1/auth/refresh`
-- 多个 `/api/v1/admin/*` 管理端路由，受 `auth.AdminOnly` 限制。
+- `GET /api/v1/auth/login`、`GET /api/v1/auth/callback` — OAuth
+- `POST /api/v1/auth/login` — 本地 `local` / LDAP 等凭证登录
+- `POST /api/v1/auth/register` — 本地注册（公开注册或邀请码）
+- `GET /api/v1/auth/me`、`POST /api/v1/auth/refresh`
+- Admin（`auth.AdminOnly`）：`GET/PATCH/DELETE /api/v1/admin/users`、`PATCH .../quota`、`GET .../logins`
+- Admin 邀请码：`GET/POST /api/v1/admin/auth/invite-codes`、`PATCH/DELETE .../invite-codes/{id}`
+- Admin Provider：`GET/POST /api/v1/admin/auth/providers`、`PATCH/DELETE .../providers/{name}`
+
+`authEngine == nil`（无 PostgreSQL）时，除健康检查等白名单外，多数 `/api/v1/*` 返回 503；详见 §12.1。
 
 Gateway 启用后才注册：
 
@@ -776,6 +784,8 @@ GET /api/v1/ws
 
 - `/login`
 - `/auth/callback`
+- `/register` — 公开自助注册（需 `allow_public_registration=true`）
+- `/register/invite` — 持邀请码注册
 
 普通受保护路由，包裹 `AuthGuard` 和 `AppShell`：
 
@@ -797,7 +807,8 @@ GET /api/v1/ws
 - `/admin/skills`
 - `/admin/settings`
 - `/admin/guide`
-- `/admin/users`
+- `/admin/users` — 用户列表、角色/状态、配额
+- `/admin/invite-codes` — 邀请码管理（创建时明文仅返回一次）
 - `/admin/usage`
 - `/admin/auth-providers`
 - `/admin/prompts`
@@ -947,7 +958,8 @@ Memory / KB / Asset：
 Auth：
 
 - `auth_providers`
-- `users`
+- `users`（含 `password_hash`，`auth_provider=local` 为本地账号）
+- `auth_invite_codes`（邀请码哈希、次数、过期、角色）
 - `user_external_ids`
 - `login_history`
 - `user_quotas`
@@ -963,30 +975,417 @@ IM / 定时任务：
 - `wechat_conversations`
 - `hive_session_todos`
 
-## 12. Auth、Admin 与配额
+## 12. 认证、用户管理与配额
 
-Auth 只有在 `auth.enabled=true` 且 PG pool 可用时初始化。
+本节描述已落地的 **Web 认证、本地注册、邀请码、Admin 用户/Provider 管理**（原规划见仓库历史；实现以 `internal/auth`、`internal/api/*_handlers.go` 为准）。
 
-初始化行为：
+### 12.1 何时启用
 
-- 校验 `auth.frontend_url` 必须是 `http://` 或 `https://`。
-- 解析或生成 JWT secret。
-- 从配置 seed auth providers 到 DB。
-- 从 DB 加载 OAuth/Credential providers。
-- 没有 provider 时只打 warn，不会阻止启动。
+| 条件 | 行为 |
+|------|------|
+| PostgreSQL 连接池可用 | `initAuthEngine` 创建 `AuthEngine`，挂载 JWT 中间件 |
+| 无 PG（`pool == nil`） | `authEngine == nil`；`/api/v1/auth/status` 返回 `enabled: false`；业务 API 除白名单外 **503** |
 
-用户行为：
+> `config.json` 中的 `auth.enabled` **已废弃**（仅 JSON 兼容）；是否启用认证由 **数据库是否可用** 决定，与 `config.example.json` 注释一致。
 
-- OAuth 登录时按 provider + external ID 查找或创建用户。
-- 第一个创建的用户自动成为 `admin`。
-- 用户状态必须是 `active` 才能使用。
-- Admin API 通过 `auth.AdminOnly` 包装。
-- IM 用户关联不会自动创建用户，只会关联已经通过 Web 登录注册的用户。
+核心代码：`internal/bootstrap/server.go`（`initAuthEngine`）、`internal/auth/middleware.go`。
 
-配额：
+### 12.2 配置项（`config.auth`）
 
-- AuthEngine 注入 Master 后，运行时可做 quota check 和 usage record。
-- `usage_records` 由 CostTracker 记录，并有 90 天清理 worker。
+| 字段 | 说明 |
+|------|------|
+| `frontend_url` | OAuth 回调后重定向前端根 URL；须 `http://` 或 `https://` |
+| `jwt_ttl` | 单次 JWT 有效期（默认 `24h`）；到期前前端 `POST /auth/refresh` |
+| `jwt_max_ttl` | 自首次登录起的绝对最长会话（默认 `168h`） |
+| `jwt_secret` | 省略时写入 DB `configs.auth.jwt_secret` |
+| `allow_public_registration` | 默认 `false`；`true` 时开放 `POST /auth/register` 无邀请码注册 |
+| `invite_error_weak_distinction` | `true` 时过期邀请码返回 `invite_expired`，否则统一 `invite_invalid` |
+| `seed_default_admin` | 默认 `true`：若不存在 `local` 用户 `admin`，幂等插入 **admin/admin**（与是否已有 OAuth 用户无关） |
+| `providers[]` | 启动时 UPSERT 到 `auth_providers`；运行时可在 Admin 增删改 |
+
+示例见 `config.example.json` 的 `auth` 段。
+
+### 12.2.1 认证 Provider 使用说明（管理后台 + 配置）
+
+管理后台路径：**`/admin/auth-providers`**（需 admin 登录）。用于配置 **Web 登录** 的飞书、钉钉、LDAP 等；与 **IM 通道**（`channel.*`，机器人/ webhook）是两套配置，不要混用。
+
+#### 配置存在哪里
+
+| 层级 | 说明 |
+|------|------|
+| **运行时真相** | PostgreSQL 表 `auth_providers`（`name`、`provider_type`、`enabled`、`config_json`） |
+| **`config.json`** | 启动时把 `auth.providers[]` **UPSERT** 进上表（同名覆盖 `config_json`） |
+| **管理后台** | 列表展示 DB 记录；**新建只写 name + 类型，不写密钥** |
+
+因此：**不是只能写 `config.json`**，但必须让 `config_json` 里有完整密钥；仅点后台「添加 Provider」不够。
+
+#### 三种配置方式怎么选
+
+| 方式 | 何时用 | 是否要重启 |
+|------|--------|------------|
+| **`config.json` → `auth.providers[]`** | 本地开发、Git 管理配置、批量 seed | 改完后 **重启服务** 才会 UPSERT |
+| **Admin API** | 生产改密钥、不想动文件、热更新 | **不需要**重启（会 `LoadProvidersFromDB`） |
+| **管理后台 UI** | 建记录、启用/禁用、删除 | 新建后仍需 **config.json 或 API** 补 `config_json` |
+
+#### 管理后台字段含义
+
+**「Provider 名称（唯一标识）」** = 表字段 **`name`**：Hive 内部给这条登录方式起的 ID，**全库唯一**。
+
+- **不是** 飞书 `app_id`、钉钉 `app_key`，也不是开放平台应用显示名。
+- **建议**：`name` 与下拉 **类型** 一致，例如类型选 `feishu` 就填 **`feishu`**。
+- 若填成 `test`、类型选 `feishu`：列表显示 `test`，但 OAuth 登录 URL 仍须 `?provider=feishu`（见下节「内存注册规则」）。
+
+下拉 **类型** = **`provider_type`**：决定走哪套实现（`feishu` / `dingtalk` / `ldap` / `wecom`）。
+
+**内存注册规则（易踩坑）**：`LoadProvidersFromDB` 后，OAuth/LDAP 在进程内以 **`provider_type` 为键**（如 `feishu`），不是自定义 `name`。登录页跳转：
+
+```text
+GET /api/v1/auth/login?provider=feishu
+```
+
+`provider` 参数应填 **`feishu`**，不要填 `test`。
+
+#### 推荐操作流程（以飞书为例）
+
+**方式 A：只用 `config.json`（最常见）**
+
+1. 在 [飞书开放平台](https://open.feishu.cn/app) 创建自建应用，开通 **网页应用登录**，记下 **App ID / App Secret**。
+2. 在飞书后台配置 **重定向 URL**（与 Hive 完全一致），例如：  
+   `http://你的后端主机:端口/api/v1/auth/callback?provider=feishu`
+3. 编辑 `config.json`（可复制 `config.example.json` 中 `auth.providers` 飞书段）：
+
+```json
+{
+  "name": "feishu",
+  "provider_type": "feishu",
+  "enabled": true,
+  "config": {
+    "app_id": "cli_你的AppID",
+    "app_secret": "你的AppSecret",
+    "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=feishu"
+  }
+}
+```
+
+4. 设置 `auth.frontend_url` 为前端地址（如 `http://localhost:3000`）。
+5. **重启** Hive 服务。
+6. 打开登录页，应出现「飞书登录」；勿在后台再建一条空配置的重复 `feishu`（同名 UPSERT 会覆盖，不同名可能混淆）。
+
+**方式 B：后台先建壳 + Admin API 写密钥**
+
+1. 管理后台 **添加 Provider**：名称 **`feishu`**，类型 **`feishu`**（先可为「禁用」）。
+2. 用 admin 的 JWT 调用（见 §12.3.1 末尾 curl）`POST` 或 `PATCH` 写入 `config_json`，再 `"enabled": true`。
+3. 或在后台对该条点 **启用**（前提是 `config_json` 已非空）。
+
+**方式 C：已在后台建了 `test` + feishu**
+
+- 要么删除 `test`，改用 `config.json` 种子 **`name: feishu`**；
+- 要么 `PATCH /api/v1/admin/auth/providers/test` 补全 `config_json`，登录时仍用 **`?provider=feishu`**（不推荐长期保留 name≠type）。
+
+#### 启用与校验清单
+
+- [ ] PostgreSQL 已连接（`/api/v1/auth/status` → `"enabled": true`）
+- [ ] `config_json` 含对应类型必填字段（飞书：`app_id`、`app_secret`、`redirect_url`）
+- [ ] 管理后台该 Provider 为 **已启用**，或 `config.json` 里 `"enabled": true`
+- [ ] 开放平台回调地址与 `redirect_url` **完全一致**（含 `provider=` 查询参数）
+- [ ] `auth.frontend_url` 与用户浏览器访问的前端一致
+- [ ] 本地先用种子账号 **`admin` / `admin`** 登录管理后台（`seed_default_admin`）
+
+#### 本地账号与其它登录并存
+
+| 登录 | 说明 |
+|------|------|
+| **local** | 内置；启动可种子 `admin/admin`；登录页账密 **默认走 local** |
+| **feishu / dingtalk** | 登录页 OAuth 按钮 |
+| **ldap** | `POST /auth/login` + `provider: ldap`；与 local 同表单时需代码/配置区分（见 §12.3.1 ③） |
+| **wecom** | 认证 Provider **不支持 Web 登录**；企微见 `channel.wecom` §12.3.1 ④ |
+
+用户注册、邀请码、Admin 用户管理见 §12.4 起。
+
+#### 四种类型配置字段速查
+
+完整 JSON 与开放平台链接见 **§12.3.1**。下表仅作对照：
+
+| provider_type | config 主要字段 | Web 登录 |
+|---------------|-----------------|----------|
+| `feishu` | `app_id`, `app_secret`, `redirect_url` | ✅ OAuth |
+| `dingtalk` | `app_key`, `app_secret`, `redirect_url` | ✅ OAuth |
+| `ldap` | `host`, `base_dn`, `bind_dn`, `bind_password`, `use_tls` | ✅ 账密 |
+| `wecom` | （认证侧无实现） | ❌ 用 `channel.wecom` |
+
+### 12.3 登录方式
+
+| 方式 | Provider | API / 页面 |
+|------|----------|------------|
+| **本地账密** | 内置 `local`（`MountLocalProvider`） | `POST /api/v1/auth/login` body: `{ "provider": "local", "username", "password" }`；登录页在存在 local 时走同一表单 |
+| **OAuth** | 配置中的 oauth（飞书等） | `GET /api/v1/auth/login?provider=` → callback → 前端 `/auth/callback#token=` |
+| **LDAP** | DB 中 `provider_type=ldap` | 同上 `POST /auth/login`，`provider` 为 LDAP 名；登录页自动选第一个 ldap |
+
+通用规则：
+
+- 用户 `status` 须为 `active`。
+- **OAuth 首次登录**：按 provider + external ID 创建用户；若当时 `users` 表为空，该用户为 **admin**（`bootstrapMu` 防并发双 admin）。
+- **IM**：`GetUserByExternalIDAndProviderType` **不自动建用户**；须先在 Web 侧登录/注册后再做 IM 关联。
+
+#### 12.3.1 认证 Provider 配置示例（四种类型 Demo）
+
+操作步骤、管理后台「唯一标识」含义、是否必须写 `config.json` 等见 **§12.2.1**。本节为各类型 **可复制 JSON** 与开放平台文档链接。
+
+完整模板在 **`config.example.json` → `auth.providers[]`**。
+
+| 类型 | Web 登录 | 实现文件 | 配置方式 |
+|------|----------|----------|----------|
+| `feishu` | OAuth 按钮 | `internal/auth/feishu.go` | 见下表 ① |
+| `dingtalk` | OAuth 按钮 | `internal/auth/dingtalk.go` | 见下表 ② |
+| `ldap` | 账密（`POST /auth/login`） | `internal/auth/ldap.go` | 见下表 ③ |
+| `wecom` | **暂未实现** | — | 见下表 ④（仅 IM） |
+
+**通用**：`auth.frontend_url` 为 OAuth 成功后前端地址（如 `http://localhost:3000`）；`redirect_url` 填 **后端回调**，并在各开放平台配置为合法回调地址。
+
+---
+
+**① 飞书 `feishu`**
+
+| 字段 | 说明 |
+|------|------|
+| `app_id` | 飞书开放平台应用 App ID |
+| `app_secret` | App Secret |
+| `redirect_url` | 如 `http://127.0.0.1:8080/api/v1/auth/callback?provider=feishu` |
+
+```json
+{
+  "name": "feishu",
+  "provider_type": "feishu",
+  "enabled": true,
+  "config": {
+    "app_id": "cli_xxxxxxxx",
+    "app_secret": "CHANGE_ME",
+    "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=feishu"
+  }
+}
+```
+
+文档：[飞书开放平台 - 网页应用登录](https://open.feishu.cn/document/common-capabilities/sso/web-application-sso/web-app-overview)
+
+用户流程：登录页点「飞书登录」→ `GET /api/v1/auth/login?provider=feishu` → 飞书授权 → 回调签发 JWT → 前端 `/auth/callback#token=...`。
+
+---
+
+**② 钉钉 `dingtalk`**
+
+| 字段 | 说明 |
+|------|------|
+| `app_key` | 钉钉应用 AppKey（原 ClientId） |
+| `app_secret` | AppSecret |
+| `redirect_url` | 如 `http://127.0.0.1:8080/api/v1/auth/callback?provider=dingtalk` |
+
+```json
+{
+  "name": "dingtalk",
+  "provider_type": "dingtalk",
+  "enabled": true,
+  "config": {
+    "app_key": "dingxxxxxxxx",
+    "app_secret": "CHANGE_ME",
+    "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=dingtalk"
+  }
+}
+```
+
+文档：[钉钉开放平台 - 登录](https://open.dingtalk.com/document/orgapp/tutorial-obtaining-user-personal-information)
+
+用户流程：登录页「钉钉登录」→ `?provider=dingtalk` → 钉钉授权 → 同上回调。
+
+---
+
+**③ LDAP `ldap`**
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `host` | 是 | LDAP 主机 |
+| `port` | 否 | 默认 389；LDAPS 常用 636 + `use_tls: true` |
+| `base_dn` | 是 | 搜索基准 DN |
+| `bind_dn` / `bind_password` | 是 | 只读服务账号 |
+| `use_tls` | 否 | `true` → `ldaps://` |
+
+```json
+{
+  "name": "ldap",
+  "provider_type": "ldap",
+  "enabled": true,
+  "config": {
+    "host": "ldap.example.com",
+    "port": 389,
+    "base_dn": "ou=people,dc=example,dc=com",
+    "bind_dn": "cn=readonly,dc=example,dc=com",
+    "bind_password": "CHANGE_ME",
+    "use_tls": false
+  }
+}
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"ldap","username":"zhangsan","password":"LDAP密码"}'
+```
+
+- 过滤器为 **`(uid=<username>)`**（OpenLDAP）；AD 需 `uid` 与登录名一致或改代码。
+- 与本地 `local` 并存时，登录页账密默认走 **local**（种子 admin）；纯 LDAP 可只启用 ldap 或显式 `provider: ldap`。
+
+---
+
+**④ 企业微信 `wecom`**
+
+- **Web 登录**：管理后台下拉可选，但 `internal/auth/engine.go` **未注册 wecom OAuth**，`enabled: true` 时只会打日志「未知 provider 类型」，**不能用于登录**。
+- **企业微信能力**：走 IM 通道，配置在 **`config.json` → `channel.wecom`**（与认证 Provider 不是同一张表）：
+
+```json
+"channel": {
+  "wecom": {
+    "enabled": false,
+    "corp_id": "wwxxxxxxxx",
+    "agent_id": 1000002,
+    "secret": "CHANGE_ME",
+    "token": "回调 Token",
+    "encoding_aes_key": "43字符EncodingAESKey"
+  }
+}
+```
+
+Webhook：`GET/POST /api/v1/channel/wecom/webhook`。详见 §13 IM Channel。
+
+---
+
+**方式二：Admin API 写入配置（与 `config.json` 二选一或混用）**
+
+> **不必用 curl。** 更常见的做法是编辑 **`config.json` → `auth.providers[]`**（字段名用 `config`，不是 `config_json`），保存后 **重启服务**，启动时会 UPSERT 到数据库。下面 curl 等价于「不重启、直接写库」，适合生产改密钥或自动化脚本。两种方式写入的都是同一张表 `auth_providers`。
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/api/v1/admin/auth/providers \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "feishu",
+    "provider_type": "feishu",
+    "enabled": true,
+    "config_json": {
+      "app_id": "cli_xxxxxxxx",
+      "app_secret": "YOUR_SECRET",
+      "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=feishu"
+    }
+  }'
+```
+
+创建后可在管理后台点 **启用**；或 `PATCH /api/v1/admin/auth/providers/feishu` 传 `{ "enabled": true }`。
+
+### 12.4 注册与邀请码
+
+#### 公开注册（`/register`）
+
+- 条件：`GET /auth/status` → `allow_public_registration: true` 且 `authEngine` 就绪。
+- `POST /api/v1/auth/register` body 示例：
+
+```json
+{
+  "email": "user@example.com",
+  "password": "至少8位",
+  "display_name": "可选"
+}
+```
+
+- 密码策略：`internal/auth.ValidateLocalPassword`，最少 8 字符（bcrypt 存储）。
+- 关闭公开注册时返回 `403` / `registration_closed`。
+- 同 IP 注册失败与登录共用限流窗口。
+
+#### 邀请码注册（`/register/invite`）
+
+- body 增加 `invite_code`；**角色以邀请码为准**（`user` / `admin`）。
+- 邀请码校验：哈希存储、未禁用、`use_count < max_uses`、未过期；注册成功事务内 `use_count+1`。
+- 无邀请码时注册 **admin**：仅当 `users` 表为空，或配置允许的首个 bootstrap 场景；否则 `admin_requires_invite`。
+
+#### Admin 邀请码 API
+
+- `POST /api/v1/admin/auth/invite-codes`：`role`、`max_uses`（默认 1）、`expires_at`（RFC3339）、`note`。
+- 响应含 **明文 `code` 仅一次**，DB 存 `code_hash` + `code_hint`。
+- `PATCH` 可禁用、改备注、延长未过期码的 `expires_at`；`DELETE` 删除记录。
+
+### 12.5 HTTP API 与中间件
+
+**公开路径**（无需 JWT，见 `auth.publicPaths`）：
+
+- `/api/v1/auth/status`、`/providers`、`/login`、`/callback`、`/register`、`/refresh`
+- `/api/v1/health`、Channel webhook、`/api/v1/ws`（WS 在 handler 内验 JWT 或 `websocket_token`）
+
+**需 JWT**：其余 `/api/v1/*`；`Authorization: Bearer <token>`。
+
+**Admin**：`auth.AdminOnly` — `role=admin` 且 `status=active`；`authEngine == nil` 时 Admin 路由不校验（仅内网开发，勿暴露公网）。
+
+**用户管理**（`internal/api/admin_handlers.go`）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/admin/users` | 分页、`q` 搜索 |
+| GET | `/api/v1/admin/users/{id}` | 含配额 |
+| PATCH | `/api/v1/admin/users/{id}` | `role` / `status`；**不能改自己的 role** |
+| PATCH | `/api/v1/admin/users/{id}/quota` | Token 配额 |
+| GET | `/api/v1/admin/users/{id}/logins` | 登录历史 |
+| DELETE | `/api/v1/admin/users/{id}` | 不能删自己；不能删 **最后一个 active admin** |
+
+修改 role/status 后会 `InvalidateUserCacheCluster`，避免旧 JWT 仍享 admin 特权。
+
+### 12.6 前端
+
+| 路径 | 组件 | 说明 |
+|------|------|------|
+| `/login` | `Login.tsx` | OAuth + local/LDAP 表单 |
+| `/auth/callback` | 解析 `#token` / `#error` | OAuth 回跳 |
+| `/register` | `Register.tsx` | 公开注册入口 |
+| `/register/invite` | `RegisterInvite.tsx` | 邀请码注册 |
+| `/admin/users` | `UserList` | 用户管理 |
+| `/admin/invite-codes` | `InviteCodes` | 邀请码管理 |
+
+`store/auth.ts`：
+
+- 启动时 `GET /auth/status`；token 存 `localStorage`（`auth_token`）。
+- `api/client.ts` 自动带 Bearer；非 auth 路径 401 时尝试 refresh，失败清 token 并跳转 `/login`。
+- `logout` 取消 refresh 定时器，防止退出后 token 被写回。
+
+受保护路由包 `AuthGuard`；管理后台包 `AdminGuard`（`App.tsx`）。
+
+### 12.7 默认管理员与首个用户
+
+1. **`seed_default_admin`**：启动时若无 `external_id=admin`、`auth_provider=local`，创建密码 **admin**（日志会提示尽快修改）。
+2. **首个 OAuth/其他渠道用户**：创建时若 `CountUsers==0`，role 升为 **admin**。
+3. **公开注册首个 admin**：仅 `users` 为空且请求 `role=admin`（无邀请码）时允许；否则须 **admin 邀请码**。
+
+本地登录用户名：邮箱或 `username` 规范化后作为 `external_id`（`NormalizeLocalLogin`）。
+
+### 12.8 配额与用量
+
+- `AuthEngine` 注入 `Master` 后，运行时可 **quota check** 与 **usage record**。
+- Admin：`PATCH /admin/users/{id}/quota`；用量见 `/admin/usage/*`。
+- `usage_records` 由 CostTracker 写入，并有 90 天清理 worker。
+
+### 12.9 开发与测试
+
+- 集成测试：`internal/api/auth_flow_test.go`（注册、邀请码、删除用户、status 等）。
+- 新增 Admin 路由：`routes.go` 中 `authEngine != nil` 块 + `adminOnly` 包装。
+- 新增公开认证接口：须加入 `internal/auth/middleware.go` 的 `publicPaths`，并补测试。
+
+### 12.10 常见排障（认证）
+
+| 现象 | 检查 |
+|------|------|
+| 前端「认证服务未就绪」 | PostgreSQL 是否连通；`/api/v1/auth/status` 的 `enabled` |
+| 无法登录 admin | 种子账号 admin/admin；或邀请码注册 admin |
+| Admin 页 403 | 当前用户 `role=admin`、`status=active` |
+| 注册 403 closed | `allow_public_registration`；或走 `/register/invite` |
+| 邀请码无效 | 过期、用尽、禁用；`invite_error_weak_distinction` 对应错误码 |
+| OAuth 失败 | `frontend_url` 与前端实际地址一致；Provider 在 DB 已启用 |
+| 退出后又自动登录 | 前端 logout 是否取消 refresh（`store/auth.ts`） |
+
+更完整的 Admin/WS 排障见 §23.5、§23.6。
 
 ## 13. IM Channel
 
@@ -1380,12 +1779,7 @@ Git / PR：
 
 ### 23.6 Auth 开启后 Admin 页面不可访问
 
-检查：
-
-- `auth.enabled=true` 且 PG 可用。
-- 是否已配置 OAuth/LDAP provider。
-- 第一个注册用户会自动成为 admin。
-- 用户 `status` 是否 active，`role` 是否 admin。
+见 **§12.10**。要点：PostgreSQL 可用、`/auth/status` 为 enabled、当前账号 `role=admin` 且 `status=active`；本地可用种子 **admin/admin** 或 admin 邀请码。
 
 ### 23.7 IM 消息重复或丢失
 

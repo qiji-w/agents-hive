@@ -620,6 +620,9 @@ func loadWithBase(path string, cfg *Config) (*Config, error) {
 		return nil, errs.Wrap(errs.CodeConfigInvalid, "读取配置文件失败", err)
 	}
 
+	// 读取 config 同目录及当前工作目录下的 .env（不覆盖已 export 的变量）
+	loadDotEnvForConfig(path)
+
 	// 展开 JSON 中的 ${VAR_NAME} 环境变量占位符
 	expanded := os.ExpandEnv(string(data))
 
@@ -628,6 +631,7 @@ func loadWithBase(path string, cfg *Config) (*Config, error) {
 	}
 
 	cfg.applyEnvOverrides()
+	cfg.ensurePostgresPasswordFromDotEnv(path)
 	cfg.Resolve()
 
 	if err := cfg.HITL.Validate(); err != nil {
@@ -921,6 +925,24 @@ func (c *Config) Resolve() {
 	c.Agent.FirstToken = NormalizeFirstTokenConfig(c.Agent.FirstToken)
 	c.Agent.IMAPI = NormalizeIMAPIConfig(c.Agent.IMAPI)
 	c.Memory = NormalizeMemoryConfig(c.Memory)
+	c.resolvePostgres()
+}
+
+// resolvePostgres 规范化 PostgreSQL 连接参数（避免 localhost 走 IPv6 [::1] 导致 connection refused）。
+func (c *Config) resolvePostgres() {
+	pg := &c.Store.Postgres
+	switch strings.ToLower(strings.TrimSpace(pg.Host)) {
+	case "localhost", "":
+		pg.Host = "127.0.0.1"
+	}
+}
+
+// ensurePostgresPasswordFromDotEnv 从项目 .env 同步 POSTGRES_PASSWORD（与 docker compose 同源，优先于错误的 shell export）。
+func (c *Config) ensurePostgresPasswordFromDotEnv(configPath string) {
+	if v := dotEnvLookup(configPath, "POSTGRES_PASSWORD"); v != "" {
+		c.Store.Postgres.Password = v
+		_ = os.Setenv("POSTGRES_PASSWORD", v)
+	}
 }
 
 func NormalizeIMAPIConfig(cfg IMAPIConfig) IMAPIConfig {

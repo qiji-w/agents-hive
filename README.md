@@ -12,7 +12,7 @@
 
 **仓库地址：** [GitHub](https://github.com/chef-guo/agents-hive) | [Gitee 镜像](https://gitee.com/smart_kitchen/agents-hive)
 
-**开发者文档：** [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)
+**开发者文档：** [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) · [产品功能说明](docs/product/README.md) · [质量治理与竞品](docs/quality/README.md) · [架构与技术栈](docs/architecture/README.md)
 
 agents-hive 是面向 ReAct Agent 的工程化执行底座与质量控制平面。它不只是让模型接上工具，而是把一次复杂任务从入口、计划、工具调用、权限审批、SubAgent 协作、记忆上下文、IM 触达、执行轨迹、质量评测到优化回滚，收束到同一条可追踪、可复盘、可治理的运行链路。
 

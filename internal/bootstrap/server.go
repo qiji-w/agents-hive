@@ -887,9 +887,12 @@ func initStore(cfg *config.Config, logger *zap.Logger) (store.SessionStore, stor
 		SSLMode:  cfg.Store.Postgres.SSLMode,
 		MaxConns: cfg.Store.Postgres.MaxConns,
 	}
+	if pgCfg.DSN == "" && pgCfg.Password == "" {
+		logger.Fatal("PostgreSQL 密码未配置：请在项目根 .env 设置 POSTGRES_PASSWORD，或 export 后与 docker compose 建库密码一致")
+	}
 	pgStore, err := store.NewPostgresStore(context.Background(), pgCfg, logger)
 	if err != nil {
-		logger.Fatal("PostgreSQL 存储初始化失败", zap.Error(err))
+		logger.Fatal("PostgreSQL 存储初始化失败（请确认 docker compose up -d postgres 已运行，且 .env 中 POSTGRES_PASSWORD 与建库时一致）", zap.Error(err))
 	}
 	logger.Info("PostgreSQL 存储已初始化")
 

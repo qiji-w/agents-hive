@@ -51,7 +51,53 @@
     "jwt_ttl": "24h",
     "_comment_jwt_max_ttl": "自首次登录起的绝对最长会话（如 168h=7 天）。超过后 refresh 失败须重新登录；省略时默认 168h",
     "jwt_max_ttl": "168h",
-    "_comment_jwt_secret": "JWT 签名密钥；省略时首次启动写入数据库 configs.auth.jwt_secret"
+    "_comment_jwt_secret": "JWT 签名密钥；省略时首次启动写入数据库 configs.auth.jwt_secret",
+    "_comment_providers": "启动时 UPSERT 到 auth_providers。name 建议与 provider_type 相同（feishu/dingtalk/ldap），否则 OAuth 登录 ?provider= 可能对不上。详见 DEVELOPER_GUIDE.md §12.3.1",
+    "providers": [
+      {
+        "_comment": "飞书 Web 登录 OAuth（开放平台创建自建应用，开通网页登录；redirect_url 须在飞书后台白名单）",
+        "name": "feishu",
+        "provider_type": "feishu",
+        "enabled": false,
+        "config": {
+          "app_id": "cli_xxxxxxxx",
+          "app_secret": "CHANGE_ME",
+          "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=feishu"
+        }
+      },
+      {
+        "_comment": "钉钉 Web 登录 OAuth（开放平台 H5/扫码登录应用；redirect_url 须在钉钉后台配置）",
+        "name": "dingtalk",
+        "provider_type": "dingtalk",
+        "enabled": false,
+        "config": {
+          "app_key": "dingxxxxxxxx",
+          "app_secret": "CHANGE_ME",
+          "redirect_url": "http://127.0.0.1:8080/api/v1/auth/callback?provider=dingtalk"
+        }
+      },
+      {
+        "_comment": "LDAP 账密登录；登录名按 (uid=用户名) 在 base_dn 下搜索",
+        "name": "ldap",
+        "provider_type": "ldap",
+        "enabled": false,
+        "config": {
+          "host": "ldap.example.com",
+          "port": 389,
+          "base_dn": "ou=people,dc=example,dc=com",
+          "bind_dn": "cn=readonly,dc=example,dc=com",
+          "bind_password": "CHANGE_ME",
+          "use_tls": false
+        }
+      },
+      {
+        "_comment": "wecom：管理后台下拉可选，但 Web 登录 OAuth 尚未在 internal/auth 实现；勿 enabled:true。企业微信机器人/回调见本文件 channel.wecom",
+        "name": "wecom",
+        "provider_type": "wecom",
+        "enabled": false,
+        "config": {}
+      }
+    ]
   },
 
   "agent": {
@@ -89,7 +135,7 @@
       "_comment": "PostgreSQL 配置，type 为 postgres 时生效",
       "_comment_host": "本机 ./server 开发：先 docker compose up -d postgres（compose 已映射 127.0.0.1:5432），密码与 .env 中 POSTGRES_PASSWORD 一致；密码字段可用 ${POSTGRES_PASSWORD} 需导出该环境变量",
       "dsn": "",
-      "host": "localhost",
+      "host": "127.0.0.1",
       "port": 5432,
       "database": "claw",
       "user": "claw",

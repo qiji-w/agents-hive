@@ -40,7 +40,11 @@ func (c PostgresConfig) BuildDSN() string {
 	}
 	host := c.Host
 	if host == "" {
-		host = "localhost"
+		host = "127.0.0.1"
+	}
+	switch strings.ToLower(host) {
+	case "localhost":
+		host = "127.0.0.1"
 	}
 	port := c.Port
 	if port == 0 {
